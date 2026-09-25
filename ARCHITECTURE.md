@@ -153,3 +153,16 @@ manifest.json
 trace.jsonl
 outputs/
 ```
+
+## 8. Team contributions
+
+| Thành viên          | Vai trò chính             | Phần việc phụ trách                                                                                                                                                           |
+| ------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Hà Trung Dũng** | Coordinator / Integration | Thiết kế A2A workflow, `AgentTask` / `AgentResult`, Coordinator, Dispatcher, tích hợp các specialist agent vào `workflow.py`, kiểm thử integration và batch run toàn hệ thống |
+| **Hoàng Văn Tài** | Order / Item Agent        | Xây dựng Order/Item Agent, truy vấn và chuẩn hóa evidence về order, item, seller và tổng giá trị đơn hàng                                                                     |
+| **Trần Thị Như Ý** | Payment Agent             | Xây dựng Payment Agent, xử lý payment, payment timeline, refund timeline, đối soát thanh toán và phát hiện payment mismatch / duplicate charge / refund issue                 |
+| **Nguyễn Minh Hiển** | Shipment Agent            | Xây dựng Shipment Agent, truy vấn shipment evidence, xác định tình trạng giao hàng và phân biệt trách nhiệm seller / logistics                                                |
+| **Nguyễn Huy Hùng** | Policy / Verifier         | Xây dựng Policy Agent và Verifier, áp dụng policy theo case, kiểm tra consistency, evidence relevance, financial resolution, confidence và kết quả cuối                       |
+
+Các thành viên phát triển phần việc trên các branch riêng và được tích hợp vào workflow chung trước khi chạy toàn bộ 100 cases, validate output/trace và đóng gói submission.
+
