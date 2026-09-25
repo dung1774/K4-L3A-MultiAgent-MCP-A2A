@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from ..mcp_gateway import EvidenceGateway
 from ..models import AgentResult, AgentTask
@@ -45,19 +46,21 @@ async def collect_payment_evidence(
     if not order_id.strip():
         raise ValueError("order_id must be resolved before payment lookup")
 
-    available_tools = set(await gateway.list_tools())
-    missing_tools = [name for name in PAYMENT_TOOL_NAMES if name not in available_tools]
-    if missing_tools:
-        raise RuntimeError(f"MCP gateway is missing payment tools: {missing_tools}")
-
     evidence_by_tool: dict[str, dict[str, Any]] = {}
     evidence_refs: list[str] = []
+    errors: list[str] = []
+    required_tools = PAYMENT_TOOL_NAMES[:2]
     for tool_name in PAYMENT_TOOL_NAMES:
-        evidence = await gateway.call(
-            tool_name,
-            case_id=case_id,
-            order_id=order_id,
-        )
+        try:
+            evidence = await gateway.call(
+                tool_name,
+                case_id=case_id,
+                order_id=order_id,
+            )
+        except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            kind = "required" if tool_name in required_tools else "optional"
+            errors.append(f"{kind} {tool_name} failed: {exc}")
+            continue
         evidence_by_tool[tool_name] = evidence
         evidence_ref = evidence["evidence_ref"]
         if evidence_ref not in evidence_refs:
@@ -75,6 +78,7 @@ async def collect_payment_evidence(
         "order_id": order_id,
         "evidence_by_tool": evidence_by_tool,
         "evidence_refs": evidence_refs,
+        "errors": errors,
     }
 
 
@@ -263,6 +267,175 @@ def analyze_payment(
         ),
     }
 
+def _dict_records(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _payment_rows(evidence_by_tool: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    envelope = evidence_by_tool.get("get_order_payments", {})
+    rows = _dict_records(envelope.get("data"))
+    if rows:
+        return rows
+    timeline = evidence_by_tool.get("get_payment_timeline", {}).get("data")
+    return _dict_records(timeline.get("payments")) if isinstance(timeline, dict) else []
+
+
+def _events(
+    evidence_by_tool: dict[str, dict[str, Any]], tool_name: str
+) -> list[dict[str, Any]]:
+    data = evidence_by_tool.get(tool_name, {}).get("data")
+    if isinstance(data, dict):
+        return _dict_records(data.get("events"))
+    return _dict_records(data)
+
+
+def _amount(value: Any) -> Decimal | None:
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    return amount.quantize(Decimal("0.01"))
+
+
+def _timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _within_case_window(
+    events: list[dict[str, Any]],
+    purchase_at: Any,
+    opened_at: Any,
+) -> list[dict[str, Any]]:
+    start = _timestamp(purchase_at)
+    end = _timestamp(opened_at)
+    selected: list[dict[str, Any]] = []
+    for event in events:
+        occurred = _timestamp(event.get("event_at"))
+        if occurred is None:
+            selected.append(event)
+        elif (start is None or occurred >= start) and (end is None or occurred <= end):
+            selected.append(event)
+    return selected
+
+
+def normalize_payment_evidence(
+    evidence_by_tool: dict[str, dict[str, Any]],
+    expected_total_brl: Any = None,
+    purchase_at: Any = None,
+    opened_at: Any = None,
+) -> dict[str, Any]:
+    """Normalize only fields observed in the public MCP payment shapes."""
+
+    payments = _payment_rows(evidence_by_tool)
+    timeline_events = _within_case_window(
+        _events(evidence_by_tool, "get_payment_timeline"),
+        purchase_at,
+        opened_at,
+    )
+    refund_events = _within_case_window(
+        _events(evidence_by_tool, "get_refund_timeline"),
+        purchase_at,
+        opened_at,
+    )
+
+    expected = _amount(expected_total_brl) if expected_total_brl is not None else None
+
+    fingerprints = [
+        (
+            str(row.get("payment_sequential", "")),
+            str(row.get("payment_type", "")),
+            str(row.get("payment_installments", "")),
+            str(row.get("payment_value", "")),
+        )
+        for row in payments
+    ]
+    duplicate_rows = len(fingerprints) != len(set(fingerprints))
+
+    capture_events = [
+        event
+        for event in timeline_events
+        if str(event.get("event_type", "")).lower() in {"captured", "charged"}
+        and str(event.get("status", "")).lower() in {"confirmed", "completed", "captured", "success"}
+    ]
+    captured_values = [
+        amount
+        for event in capture_events
+        if (amount := _amount(event.get("amount_brl"))) is not None
+    ]
+    if not captured_values:
+        captured_values = [
+            amount
+            for row in payments
+            if (amount := _amount(row.get("payment_value"))) is not None
+        ]
+    captured_total = sum(captured_values, Decimal("0.00"))
+    capture_count = len(capture_events) if capture_events else len(payments)
+    amount_counts = Counter(captured_values)
+    duplicate_events = any(count > 1 for count in amount_counts.values()) and (
+        expected is None or captured_total > expected
+    )
+
+    refund_statuses = {
+        str(event.get("status") or event.get("event_type") or "").lower()
+        for event in refund_events
+    }
+    has_mismatch_event = any(
+        str(event.get("event_type", "")).lower() == "reconciliation_mismatch"
+        for event in timeline_events
+    )
+    if refund_statuses & {"failed", "rejected", "error"}:
+        verdict = "refund_failed"
+        confidence = 0.94
+    elif refund_statuses & {"pending", "processing", "requested", "initiated"}:
+        verdict = "refund_pending"
+        confidence = 0.91
+    elif duplicate_events or (duplicate_rows and expected is None):
+        verdict = "duplicate_charge"
+        confidence = 0.90
+    elif has_mismatch_event or (expected is not None and capture_events and captured_total != expected):
+        verdict = "payment_mismatch"
+        confidence = 0.90
+    elif expected is not None and capture_count > 1 and captured_total == expected:
+        verdict = "valid_split_payment"
+        confidence = 0.92
+    elif expected is not None and payments and captured_total == expected:
+        verdict = "payment_reconciled"
+        confidence = 0.88
+    else:
+        verdict = "insufficient_evidence"
+        confidence = 0.25 if payments or timeline_events else 0.0
+
+    actual_references: list[str] = []
+    for record in [*payments, *timeline_events, *refund_events]:
+        for key in ("payment_reference", "transaction_id"):
+            value = record.get(key)
+            if isinstance(value, str) and value:
+                actual_references.append(value)
+
+    return {
+        "payment_verdict": verdict,
+        "captured_total_brl": float(captured_total),
+        "expected_total_brl": float(expected) if expected is not None else None,
+        "payment_count": capture_count,
+        "payments": payments,
+        "payment_events": timeline_events,
+        "refund_events": refund_events,
+        "payment_references": list(dict.fromkeys(actual_references)),
+        "confidence": confidence,
+    }
+
+
 async def run(
     task: AgentTask,
     gateway: EvidenceGateway,
@@ -305,12 +478,14 @@ async def run(
 
     evidence_by_tool = collected["evidence_by_tool"]
     evidence_refs = collected["evidence_refs"]
-
-    # Keep authoritative MCP payload available to the verifier/integration
-    # layer without guessing undocumented MCP domain field names.
+    normalized = normalize_payment_evidence(
+        evidence_by_tool,
+        task.context.get("expected_total_brl"),
+        task.context.get("order_purchase_timestamp"),
+        task.context.get("opened_at"),
+    )
     findings = {
-        "payment_verdict": "insufficient_evidence",
-        "evidence_collected": True,
+        **normalized,
         "evidence_by_tool": evidence_by_tool,
     }
 
@@ -320,8 +495,7 @@ async def run(
         actor=task.actor,
         findings=findings,
         evidence_refs=evidence_refs,
-        confidence=0.25,
-        errors=[
-            "Payment MCP evidence collected but requires domain normalization."
-        ],
+        payment_references=normalized["payment_references"],
+        confidence=normalized["confidence"],
+        errors=collected["errors"],
     )

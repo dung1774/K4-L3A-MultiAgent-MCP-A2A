@@ -11,11 +11,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from ..mcp_gateway import EvidenceGateway
-    from ..trace import TraceWriter
+from ..mcp_gateway import EvidenceGateway
+from ..models import AgentResult, AgentTask
+from ..trace import TraceWriter
 
 ACTOR = "shipment-agent"
 SHIPMENT_TOOL_NAME = "get_shipment_summary"
@@ -23,61 +23,6 @@ SHIPMENT_TOOL_NAME = "get_shipment_summary"
 
 class ShipmentEvidenceError(ValueError):
     """Raised when a shipment evidence payload cannot be analysed safely."""
-
-
-@dataclass(frozen=True)
-class AgentTask:
-    """Temporary shared-task envelope until TV1 centralizes team contracts.
-
-    Shipment tasks require ``payload["order_id"]``.  They may also provide
-    ``payload["as_of"]`` and ``payload["handoff_target"]``.
-    """
-
-    task_id: str
-    case_id: str
-    payload: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        if not self.task_id:
-            raise ValueError("task_id must not be empty")
-        if not self.case_id:
-            raise ValueError("case_id must not be empty")
-        if not isinstance(self.payload, Mapping):
-            raise TypeError("payload must be a mapping")
-
-
-@dataclass(frozen=True)
-class AgentResult:
-    """JSON-friendly specialist result returned to the coordinator/verifier."""
-
-    task_id: str
-    case_id: str
-    agent: str
-    status: str
-    findings: list[dict[str, Any]]
-    entities: dict[str, list[str]]
-    evidence_refs: list[str]
-    responsible_parties: list[dict[str, Any]]
-    recommended_primary_issue: str | None
-    decision_code: str
-    summary: dict[str, int]
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return a plain mapping for assembly or A2A serialization."""
-
-        return {
-            "task_id": self.task_id,
-            "case_id": self.case_id,
-            "agent": self.agent,
-            "status": self.status,
-            "findings": self.findings,
-            "entities": self.entities,
-            "evidence_refs": self.evidence_refs,
-            "responsible_parties": self.responsible_parties,
-            "recommended_primary_issue": self.recommended_primary_issue,
-            "decision_code": self.decision_code,
-            "summary": self.summary,
-        }
 
 
 @dataclass(frozen=True)
@@ -126,6 +71,7 @@ ACTUAL_DELIVERY_FIELDS = (
     "actual_delivery_at",
     "actual_delivery_date",
     "order_delivered_customer_date",
+    "delivered_customer_at",
     "delivered_at",
     "delivered_date",
 )
@@ -134,6 +80,7 @@ HANDOFF_FIELDS = (
     "carrier_received_at",
     "carrier_pickup_at",
     "order_delivered_carrier_date",
+    "delivered_carrier_at",
     "shipped_at",
     "actual_handoff_at",
 )
@@ -325,7 +272,63 @@ def analyze_shipment_evidence(
         if not isinstance(evidence_ref, str) or not evidence_ref:
             raise ShipmentEvidenceError("shipment evidence is missing evidence_ref")
         evidence_refs.append(evidence_ref)
-        for record in _shipment_records(response.get("data")):
+        data = response.get("data")
+        direct_events = data.get("events") if isinstance(data, Mapping) else None
+        delivered_at = (
+            _as_datetime(data.get("delivered_customer_at"), "delivered_customer_at")
+            if isinstance(data, Mapping)
+            else None
+        )
+        late_events = [
+            event
+            for event in direct_events or []
+            if isinstance(event, Mapping)
+            and str(event.get("event_type", "")).lower() == "delivered_late"
+            and str(event.get("status", "")).lower() in {"confirmed", "completed"}
+            and delivered_at is not None
+            and _as_datetime(event.get("event_at"), "shipment event_at") == delivered_at
+        ]
+        if late_events and isinstance(data, Mapping):
+            shipping_limits = data.get("shipping_limits")
+            seller_id = None
+            if isinstance(shipping_limits, list):
+                seller_id = next(
+                    (
+                        _as_text(item.get("seller_id"))
+                        for item in shipping_limits
+                        if isinstance(item, Mapping) and item.get("seller_id")
+                    ),
+                    None,
+                )
+            for event in late_events:
+                actor = str(event.get("actor", "")).lower()
+                attribution = (
+                    "seller"
+                    if actor == "seller"
+                    else "logistics_provider"
+                    if actor in {"logistics", "logistics_provider", "carrier"}
+                    else "unknown"
+                )
+                findings.append(
+                    {
+                        "shipment_id": _as_text(data.get("shipment_id")),
+                        "order_id": _as_text(data.get("order_id")),
+                        "seller_id": seller_id,
+                        "logistics_provider": _as_text(event.get("provider_id")),
+                        "shipping_status": _as_text(data.get("order_status")),
+                        "estimated_delivery_at": _as_text(data.get("estimated_delivery_at")),
+                        "actual_delivery_at": _as_text(data.get("delivered_customer_at")),
+                        "handed_to_carrier_at": _as_text(data.get("delivered_carrier_at")),
+                        "handoff_deadline_at": None,
+                        "is_late": True,
+                        "late_by_days": None,
+                        "delay_attribution": attribution,
+                        "reason_code": "CONFIRMED_DELIVERED_LATE_EVENT",
+                        "evidence_refs": [evidence_ref],
+                    }
+                )
+            continue
+        for record in _shipment_records(data):
             findings.append(_classify_record(record, evidence_ref, default_as_of))
 
     seller_delays = [item for item in findings if item["delay_attribution"] == "seller"]
@@ -442,13 +445,6 @@ async def run_shipment_agent(
     return result
 
 
-def _required_task_text(task: AgentTask, field: str) -> str:
-    value = task.payload.get(field)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"AgentTask.payload[{field!r}] must be a non-empty string")
-    return value.strip()
-
-
 async def run(
     task: AgentTask,
     gateway: EvidenceGateway,
@@ -456,40 +452,67 @@ async def run(
 ) -> AgentResult:
     """Run the TV4 specialist through the team's common agent interface."""
 
-    order_id = _required_task_text(task, "order_id")
-    as_of = task.payload.get("as_of")
+    if task.actor != ACTOR:
+        raise ValueError(f"shipment agent received task for actor {task.actor!r}")
+    order_id = task.context.get("claimed_order_id")
+    if not isinstance(order_id, str) or not order_id.strip():
+        return AgentResult(
+            task_id=task.task_id,
+            case_id=task.case_id,
+            actor=ACTOR,
+            findings={"recommended_issue": "insufficient_evidence"},
+            errors=["Shipment lookup requires a resolved order_id."],
+        )
+    order_id = order_id.strip()
+    as_of = task.context.get("opened_at")
     if as_of is not None and not isinstance(as_of, (str, datetime)):
-        raise TypeError("AgentTask.payload['as_of'] must be an ISO-8601 string or datetime")
-    handoff_target = task.payload.get("handoff_target", "coordinator")
-    if not isinstance(handoff_target, str) or not handoff_target:
-        raise ValueError("AgentTask.payload['handoff_target'] must be a non-empty string")
+        raise TypeError("AgentTask.context['opened_at'] must be an ISO-8601 string or datetime")
 
-    result = await run_shipment_agent(
-        case_id=task.case_id,
-        queries=[ShipmentQuery(SHIPMENT_TOOL_NAME, {"order_id": order_id})],
-        gateway=gateway,
-        trace=trace,
-        as_of=as_of,
-        handoff_target=handoff_target,
-        task_id=task.task_id,
-    )
-    status = (
-        "needs_investigation"
-        if result["decision_code"] == "SHIPMENT_ATTRIBUTION_UNRESOLVED"
-        else "completed"
-    )
+    errors: list[str] = []
+    try:
+        response = await gateway.call(
+            SHIPMENT_TOOL_NAME,
+            case_id=task.case_id,
+            order_id=order_id,
+        )
+        evidence_ref = response["evidence_ref"]
+        trace.emit(
+            case_id=task.case_id,
+            event_type="tool_result_consumed",
+            actor=ACTOR,
+            tool_name=SHIPMENT_TOOL_NAME,
+            evidence_refs=[evidence_ref],
+            attributes={"task_id": task.task_id},
+        )
+        result = analyze_shipment_evidence([response], as_of=as_of)
+    except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+        errors.append(f"required {SHIPMENT_TOOL_NAME} failed: {exc}")
+        result = {
+            "findings": [],
+            "entities": {"shipment_ids": [], "order_ids": [], "seller_ids": []},
+            "evidence_refs": [],
+            "responsible_parties": [],
+            "recommended_primary_issue": "insufficient_evidence",
+            "decision_code": "SHIPMENT_EVIDENCE_UNAVAILABLE",
+            "summary": {"shipments_checked": 0, "late_shipments": 0},
+        }
     return AgentResult(
         task_id=task.task_id,
         case_id=task.case_id,
-        agent=ACTOR,
-        status=status,
-        findings=result["findings"],
-        entities=result["entities"],
+        actor=ACTOR,
+        findings={
+            "shipments": result["findings"],
+            "responsible_parties": result["responsible_parties"],
+            "recommended_issue": result["recommended_primary_issue"],
+            "decision_code": result["decision_code"],
+            "summary": result["summary"],
+        },
+        order_ids=result["entities"].get("order_ids", []),
+        seller_ids=result["entities"].get("seller_ids", []),
+        shipment_ids=result["entities"].get("shipment_ids", []),
         evidence_refs=result["evidence_refs"],
-        responsible_parties=result["responsible_parties"],
-        recommended_primary_issue=result["recommended_primary_issue"],
-        decision_code=result["decision_code"],
-        summary=result["summary"],
+        confidence=0.85 if result["recommended_primary_issue"] not in {None, "insufficient_evidence"} else 0.4,
+        errors=errors,
     )
 
 

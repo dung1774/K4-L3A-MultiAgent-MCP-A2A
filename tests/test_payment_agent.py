@@ -219,3 +219,55 @@ def test_payment_agent_run_matches_common_contract():
     assert result.task_id == task.task_id
     assert result.actor == "payment-agent"
     assert result.evidence_refs
+
+
+def test_payment_agent_normalizes_real_mcp_shape_without_fabricated_ids():
+    from student_agent.agents.payment_agent import run
+    from student_agent.models import AgentTask
+
+    gateway = AsyncMock()
+
+    async def call(tool_name, *, case_id, order_id):
+        assert case_id == "CASE_005"
+        if tool_name == "get_order_payments":
+            return {
+                "evidence_ref": "ev_" + "p" * 20,
+                "data": [
+                    {
+                        "order_id": order_id,
+                        "payment_sequential": "1",
+                        "payment_type": "credit_card",
+                        "payment_installments": "1",
+                        "payment_value": "60.00",
+                    },
+                    {
+                        "order_id": order_id,
+                        "payment_sequential": "2",
+                        "payment_type": "voucher",
+                        "payment_installments": "1",
+                        "payment_value": "40.00",
+                    },
+                ],
+            }
+        if tool_name == "get_payment_timeline":
+            return {
+                "evidence_ref": "ev_" + "t" * 20,
+                "data": {"order_id": order_id, "payments": [], "events": []},
+            }
+        raise RuntimeError("no refund information")
+
+    gateway.call = call
+    task = AgentTask(
+        case_id="CASE_005",
+        task_id="CASE_005:payment-agent",
+        actor="payment-agent",
+        objective="Verify payment.",
+        context={"claimed_order_id": "order-5", "expected_total_brl": 100.0},
+    )
+    result = asyncio.run(run(task, gateway, Mock()))
+    assert result.findings["payment_verdict"] == "valid_split_payment"
+    assert result.payment_references == []
+    assert len(result.evidence_refs) == 2
+    assert result.errors == [
+        "optional get_refund_timeline failed: no refund information"
+    ]

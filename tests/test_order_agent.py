@@ -1,130 +1,81 @@
-﻿"""Tests for TV2 order_agent.
-
-All tests use mocks — no real MCP server or TraceWriter needed.
-Evidence refs follow the pattern ev_<20+chars> as per the schema.
-No pytest-asyncio required: sync wrappers use asyncio.run().
-"""
-
 from __future__ import annotations
 
 import asyncio
 from typing import Any
 from unittest.mock import MagicMock
 
-from student_agent.agents.order_agent import AgentTask, run
+from student_agent.agents.order_agent import run
+from student_agent.models import AgentResult, AgentTask
+
+ORDER_REF = "ev_order_canceledAAAAAAAAAAAA"
+ITEMS_REF = "ev_items_canceledAAAAAAAAAAAA"
 
 
-_ORDER_EV_REF = "ev_order_canceledAAAAAAAAAAAA"
-_ITEMS_EV_REF = "ev_items_canceledAAAAAAAAAAAA"
-_SELLERS_EV_REF = "ev_sellers_lateAAAAAAAAAAAAAA"
+def _task(case_id: str = "L3A_CASE_TEST") -> AgentTask:
+    return AgentTask(
+        case_id=case_id,
+        task_id=f"{case_id}:order-agent",
+        actor="order-agent",
+        objective="Verify order and items.",
+        context={"claimed_order_id": "order-xyz"},
+    )
 
-assert all(len(r) >= 23 for r in [_ORDER_EV_REF, _ITEMS_EV_REF, _SELLERS_EV_REF])
 
-
-def _make_gateway(order_status: str, has_items: bool = True) -> MagicMock:
-    order_response: dict[str, Any] = {
-        "schema_version": "day09-mcp-evidence-v1",
-        "evidence_ref": _ORDER_EV_REF,
-        "result_hash": "sha256:" + "a" * 64,
-        "domain": "order",
-        "data": {"order_id": "order-xyz", "order_status": order_status},
-    }
-    items_response: dict[str, Any] = {
-        "schema_version": "day09-mcp-evidence-v1",
-        "evidence_ref": _ITEMS_EV_REF,
-        "result_hash": "sha256:" + "b" * 64,
-        "domain": "item",
-        "data": [{"order_item_id": "1", "seller_id": "seller-abc", "price": 100.0}] if has_items else [],
-    }
-    sellers_response: dict[str, Any] = {
-        "schema_version": "day09-mcp-evidence-v1",
-        "evidence_ref": _SELLERS_EV_REF,
-        "result_hash": "sha256:" + "c" * 64,
-        "domain": "seller",
-        "data": {"seller_id": "seller-abc", "seller_city": "Sao Paulo"},
-    }
-
-    async def _call(tool_name: str, *, case_id: str, **kwargs: Any) -> dict[str, Any]:
+def _gateway(status: str, *, fail_items: bool = False) -> MagicMock:
+    async def call(tool_name: str, *, case_id: str, **kwargs: Any) -> dict[str, Any]:
+        assert case_id.startswith("L3A_CASE")
         if tool_name == "get_order":
-            return order_response
+            return {
+                "evidence_ref": ORDER_REF,
+                "data": {"order_id": "order-xyz", "order_status": status},
+            }
         if tool_name == "get_order_items":
-            return items_response
-        if tool_name == "get_sellers":
-            return sellers_response
-        raise RuntimeError(f"unexpected tool: {tool_name}")
+            if fail_items:
+                raise RuntimeError("temporary item lookup failure")
+            return {
+                "evidence_ref": ITEMS_REF,
+                "data": [
+                    {
+                        "order_item_id": "1",
+                        "seller_id": "seller-abc",
+                        "price": "90.00",
+                        "freight_value": "10.00",
+                    }
+                ],
+            }
+        raise AssertionError(tool_name)
 
     gateway = MagicMock()
-    gateway.call = _call
+    gateway.call = call
     return gateway
 
 
-def _make_trace() -> MagicMock:
+def test_run_uses_shared_contract_and_evidence_refs() -> None:
     trace = MagicMock()
-    trace.emit = MagicMock(return_value={})
-    return trace
+    result = asyncio.run(run(_task(), _gateway("canceled"), trace))
+    assert isinstance(result, AgentResult)
+    assert result.actor == "order-agent"
+    assert result.findings["recommended_issue"] == "canceled_order_paid"
+    assert result.findings["expected_total_brl"] == 100.0
+    assert result.evidence_refs == [ORDER_REF, ITEMS_REF]
+    assert result.order_ids == ["order-xyz"]
+    assert result.item_ids == ["1"]
+    assert result.seller_ids == ["seller-abc"]
+    assert trace.emit.call_count == 2
 
 
-def test_canceled_order_paid() -> None:
-    task = AgentTask(
-        case_id="L3A_CASE_TEST",
-        order_id="order-xyz",
-        claims=[
-            {"claim_id": "c-001", "topic": "canceled_order_paid"},
-            {"claim_id": "c-002", "topic": "requested_full_refund"},
-        ],
-    )
-    result = asyncio.run(run(task, _make_gateway("canceled"), _make_trace()))
-    assert result["primary_issue"] == "canceled_order_paid"
-    assert result["confidence"] >= 0.85
-    assert _ORDER_EV_REF in result["evidence_refs"]
-    assert _ITEMS_EV_REF in result["evidence_refs"]
-    trace = _make_trace()
-    asyncio.run(run(task, _make_gateway("canceled"), trace))
-    calls = [c.kwargs for c in trace.emit.call_args_list]
-    tool_names = [c["tool_name"] for c in calls if "tool_name" in c]
-    assert "get_order" in tool_names
-    assert "get_order_items" in tool_names
-    verdicts = result["details"]["claim_verdicts"]
-    assert verdicts[0]["verdict"] == "supported"
-    assert verdicts[1]["verdict"] == "supported"
+def test_optional_partial_failure_is_observable() -> None:
+    result = asyncio.run(run(_task(), _gateway("delivered", fail_items=True), MagicMock()))
+    assert isinstance(result, AgentResult)
+    assert result.evidence_refs == [ORDER_REF]
+    assert result.errors
+    assert "get_order_items failed" in result.errors[0]
 
 
-def test_unavailable_order_paid() -> None:
-    task = AgentTask(
-        case_id="L3A_CASE_TEST2",
-        order_id="order-xyz",
-        claims=[{"claim_id": "c-003", "topic": "unavailable_order_paid"}],
-    )
-    result = asyncio.run(run(task, _make_gateway("unavailable", has_items=False), _make_trace()))
-    assert result["primary_issue"] == "unavailable_order_paid"
-    assert result["confidence"] >= 0.80
-    assert _ORDER_EV_REF in result["evidence_refs"]
-    assert result["details"]["claim_verdicts"][0]["verdict"] == "supported"
-
-
-def test_late_delivery_seller() -> None:
-    task = AgentTask(
-        case_id="L3A_CASE_TEST3",
-        order_id="order-xyz",
-        claims=[{"claim_id": "c-004", "topic": "late_delivery_seller"}],
-    )
-    trace = _make_trace()
-    result = asyncio.run(run(task, _make_gateway("approved", has_items=True), trace))
-    assert result["primary_issue"] == "late_delivery_seller"
-    assert result["confidence"] >= 0.65
-    assert _ORDER_EV_REF in result["evidence_refs"]
-    assert _ITEMS_EV_REF in result["evidence_refs"]
-    assert "seller-abc" in result["affected_entities"]["seller_ids"]
-    calls = [c.kwargs for c in trace.emit.call_args_list]
-    tool_names = [c["tool_name"] for c in calls if "tool_name" in c]
-    assert "get_sellers" in tool_names
-    assert result["details"]["claim_verdicts"][0]["verdict"] == "supported"
-
-
-def test_no_issue_delivered_order() -> None:
-    task = AgentTask(case_id="L3A_CASE_TEST4", order_id="order-xyz", claims=[])
-    result = asyncio.run(run(task, _make_gateway("delivered"), _make_trace()))
-    assert result["primary_issue"] is None
-    assert result["confidence"] >= 0.75
-    assert _ORDER_EV_REF in result["evidence_refs"]
-    assert result["details"]["claim_verdicts"] == []
+def test_missing_order_id_returns_insufficient_evidence() -> None:
+    task = _task()
+    task.context = {}
+    result = asyncio.run(run(task, MagicMock(), MagicMock()))
+    assert result.findings["recommended_issue"] == "insufficient_evidence"
+    assert not result.evidence_refs
+    assert result.errors

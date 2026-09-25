@@ -143,6 +143,7 @@ def plan_tasks(case: dict[str, Any]) -> list[AgentTask]:
     context = {
         "claimed_order_id": request.get("claimed_order_id"),
         "policy_version": case.get("policy_version"),
+        "opened_at": case.get("opened_at"),
         "claim_ids": _claim_ids(case),
         "claim_topics": _claim_topics(case),
     }

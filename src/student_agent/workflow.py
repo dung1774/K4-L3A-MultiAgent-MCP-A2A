@@ -157,11 +157,33 @@ async def solve_case(
     specialist_results: list[AgentResult] = []
 
     for task in tasks:
-        result = await dispatch_task(
-            task,
-            gateway,
-            trace,
-        )
+        if task.actor == "payment-agent":
+            order_result = next(
+                (item for item in specialist_results if item.actor == "order-agent"),
+                None,
+            )
+            if order_result is not None:
+                expected_total = order_result.findings.get("expected_total_brl")
+                if expected_total is not None:
+                    task.context["expected_total_brl"] = expected_total
+                purchase_at = order_result.findings.get("order_purchase_timestamp")
+                if purchase_at is not None:
+                    task.context["order_purchase_timestamp"] = purchase_at
+
+        try:
+            result = await dispatch_task(
+                task,
+                gateway,
+                trace,
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            result = AgentResult(
+                case_id=task.case_id,
+                task_id=task.task_id,
+                actor=task.actor,
+                findings={"recommended_issue": "insufficient_evidence"},
+                errors=[f"invalid specialist result: {exc}"],
+            )
 
         specialist_results.append(result)
 

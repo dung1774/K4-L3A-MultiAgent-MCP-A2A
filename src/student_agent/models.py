@@ -55,3 +55,5 @@ class VerificationResult:
 
     claim_assessments: list[dict[str, Any]] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
+    checks: dict[str, bool] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
