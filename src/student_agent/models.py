@@ -48,13 +48,10 @@ class VerificationResult:
     """Schema-ready semantic result returned by the verifier."""
 
     assessment: dict[str, Any]
-
     root_cause_analysis: dict[str, Any]
-
     data_conflicts: list[dict[str, Any]]
-
     financial_resolution: dict[str, Any]
-
     resolution_actions: list[str]
 
     claim_assessments: list[dict[str, Any]] = field(default_factory=list)
+    evidence_refs: list[str] = field(default_factory=list)
