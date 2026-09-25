@@ -21,23 +21,56 @@ class EvidenceGateway:
         response = await self._session.list_tools()
         return sorted(tool.name for tool in response.tools)
 
-    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+    async def call(
+        self,
+        tool_name: str,
+        *,
+        case_id: str,
+        **arguments: str,
+    ) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
-        result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+
+        result = await self._session.call_tool(
+            tool_name,
+            arguments=payload,
+        )
+
+        # MCP Python SDK v2 uses snake_case fields.
+        if result.is_error:
             message = " ".join(
-                block.text for block in result.content if getattr(block, "text", None)
+                block.text
+                for block in result.content
+                if getattr(block, "text", None)
             )
-            raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
-        evidence = getattr(result, "structuredContent", None)
+
+            raise RuntimeError(
+                f"MCP tool {tool_name} failed: "
+                f"{message or 'unknown error'}"
+            )
+
+        evidence = result.structured_content
+
+        # Fallback for servers that return evidence as one text block.
         if evidence is None:
-            evidence = getattr(result, "structured_content", None)
-        if evidence is None:
-            text_blocks = [block.text for block in result.content if getattr(block, "text", None)]
+            text_blocks = [
+                block.text
+                for block in result.content
+                if getattr(block, "text", None)
+            ]
+
             if len(text_blocks) != 1:
-                raise ValueError(f"MCP tool {tool_name} did not return one evidence object")
+                raise ValueError(
+                    f"MCP tool {tool_name} did not return "
+                    "one evidence object"
+                )
+
             evidence = json.loads(text_blocks[0])
-        self._contracts.validate_evidence(evidence, f"MCP tool {tool_name}")
+
+        self._contracts.validate_evidence(
+            evidence,
+            f"MCP tool {tool_name}",
+        )
+
         return evidence
 
 
