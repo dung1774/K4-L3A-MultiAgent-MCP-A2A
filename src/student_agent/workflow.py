@@ -19,19 +19,36 @@ def _unique(values: list[str]) -> list[str]:
 
     return list(dict.fromkeys(values))
 
-
 def _collect_evidence_refs(
     specialist_results: list[AgentResult],
     verification: VerificationResult,
 ) -> list[str]:
-    refs: list[str] = []
+    available_refs = {
+        ref
+        for result in specialist_results
+        for ref in result.evidence_refs
+    }
 
-    for result in specialist_results:
-        refs.extend(result.evidence_refs)
+    selected_refs = _unique(verification.evidence_refs)
 
-    refs.extend(verification.evidence_refs)
+    unknown_refs = [
+        ref
+        for ref in selected_refs
+        if ref not in available_refs
+    ]
 
-    return _unique(refs)
+    if unknown_refs:
+        raise ValueError(
+            f"Verifier selected evidence not produced by specialists: "
+            f"{unknown_refs}"
+        )
+
+    if len(selected_refs) > 30:
+        raise ValueError(
+            "Verifier selected more than 30 evidence refs"
+        )
+
+    return selected_refs
 
 
 def _collect_entities(

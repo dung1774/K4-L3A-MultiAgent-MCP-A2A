@@ -1,71 +1,90 @@
+import pytest
+
 from student_agent.coordinator import plan_tasks
 
 
-def actors(case):
-    return [task.actor for task in plan_tasks(case)]
-
-
-def test_payment_case_routes_to_payment() -> None:
+@pytest.mark.parametrize(
+    ("topic", "expected"),
+    [
+        (
+            "canceled_order_paid",
+            {"order-agent", "payment-agent", "policy-agent"},
+        ),
+        (
+            "unavailable_order_paid",
+            {"order-agent", "payment-agent", "policy-agent"},
+        ),
+        (
+            "late_delivery_seller",
+            {
+                "order-agent",
+                "payment-agent",
+                "shipment-agent",
+                "policy-agent",
+            },
+        ),
+        (
+            "late_delivery_logistics",
+            {
+                "order-agent",
+                "payment-agent",
+                "shipment-agent",
+                "policy-agent",
+            },
+        ),
+        (
+            "valid_split_payment",
+            {"order-agent", "payment-agent", "policy-agent"},
+        ),
+        (
+            "payment_mismatch",
+            {"order-agent", "payment-agent", "policy-agent"},
+        ),
+        (
+            "duplicate_charge",
+            {"order-agent", "payment-agent", "policy-agent"},
+        ),
+        (
+            "refund_pending",
+            {"order-agent", "payment-agent", "policy-agent"},
+        ),
+        (
+            "refund_failed",
+            {"order-agent", "payment-agent", "policy-agent"},
+        ),
+        (
+            "unsupported_claim",
+            {
+                "order-agent",
+                "payment-agent",
+                "shipment-agent",
+                "policy-agent",
+            },
+        ),
+    ],
+)
+def test_routes_all_known_claim_topics(topic, expected):
     case = {
-        "case_id": "CASE_001",
+        "case_id": "CASE_TEST",
         "policy_version": "EC_POLICY_V1",
         "customer_request": {
-            "claimed_order_id": "order-1",
+            "claimed_order_id": "order-test",
             "claims": [
                 {
-                    "claim_id": "claim-1",
-                    "topic": "canceled_order_paid",
+                    "claim_id": "claim-main",
+                    "topic": topic,
                 },
                 {
-                    "claim_id": "claim-2",
+                    "claim_id": "claim-refund",
                     "topic": "requested_full_refund",
                 },
             ],
         },
     }
 
-    assert actors(case) == [
-        "order-agent",
-        "payment-agent",
-        "policy-agent",
-    ]
-
-
-def test_delivery_case_routes_to_shipment() -> None:
-    case = {
-        "case_id": "CASE_002",
-        "policy_version": "EC_POLICY_V1",
-        "customer_request": {
-            "claimed_order_id": "order-2",
-            "claims": [
-                {
-                    "claim_id": "claim-1",
-                    "topic": "late_delivery",
-                }
-            ],
-        },
+    actual = {
+        task.actor
+        for task in plan_tasks(case)
     }
 
-    assert actors(case) == [
-        "order-agent",
-        "shipment-agent",
-        "policy-agent",
-    ]
-
-
-def test_unknown_case_routes_broadly() -> None:
-    case = {
-        "case_id": "CASE_003",
-        "policy_version": "EC_POLICY_V1",
-        "customer_request": {
-            "claimed_order_id": "order-3",
-            "claims": [],
-        },
-    }
-
-    assert actors(case) == [
-        "order-agent",
-        "payment-agent",
-        "shipment-agent",
-        "policy-agent",
-    ]
+    assert actual == expected

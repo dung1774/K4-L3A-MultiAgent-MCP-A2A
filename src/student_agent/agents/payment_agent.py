@@ -11,6 +11,9 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from ..mcp_gateway import EvidenceGateway
+from ..models import AgentResult, AgentTask
+from ..trace import TraceWriter
 import re
 from typing import Any, Literal
 
@@ -259,3 +262,66 @@ def analyze_payment(
             dict.fromkeys(record.evidence_ref for record in refunds)
         ),
     }
+
+async def run(
+    task: AgentTask,
+    gateway: EvidenceGateway,
+    trace: TraceWriter,
+) -> AgentResult:
+    """Payment-agent entry point used by the coordinator dispatcher.
+
+    Customer claims are routing hints only. This function retrieves
+    authoritative MCP evidence and returns it through the common AgentResult
+    contract. Raw MCP field names are not guessed here; domain normalization
+    is performed only after the actual MCP response shape is known.
+    """
+
+    if task.actor != "payment-agent":
+        raise ValueError(
+            f"payment agent received task for actor {task.actor!r}"
+        )
+
+    order_id = task.context.get("claimed_order_id")
+
+    if not isinstance(order_id, str) or not order_id.strip():
+        return AgentResult(
+            case_id=task.case_id,
+            task_id=task.task_id,
+            actor=task.actor,
+            findings={
+                "payment_verdict": "insufficient_evidence",
+                "reason": "missing_order_id",
+            },
+            confidence=0.0,
+            errors=["Payment lookup requires a resolved order_id."],
+        )
+
+    collected = await collect_payment_evidence(
+        case_id=task.case_id,
+        order_id=order_id,
+        gateway=gateway,
+        trace=trace,
+    )
+
+    evidence_by_tool = collected["evidence_by_tool"]
+    evidence_refs = collected["evidence_refs"]
+
+    # Keep authoritative MCP payload available to the verifier/integration
+    # layer without guessing undocumented MCP domain field names.
+    findings = {
+        "payment_verdict": "insufficient_evidence",
+        "evidence_collected": True,
+        "evidence_by_tool": evidence_by_tool,
+    }
+
+    return AgentResult(
+        case_id=task.case_id,
+        task_id=task.task_id,
+        actor=task.actor,
+        findings=findings,
+        evidence_refs=evidence_refs,
+        confidence=0.25,
+        errors=[
+            "Payment MCP evidence collected but requires domain normalization."
+        ],
+    )

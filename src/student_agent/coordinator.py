@@ -83,42 +83,43 @@ def _claim_ids(case: dict[str, Any]) -> list[str]:
 
     return claim_ids
 
-
 def _select_specialists(case: dict[str, Any]) -> list[str]:
     """
-    Claims are only routing hints.
-
-    They are NOT treated as ground truth.
-    Every factual conclusion must still come from MCP evidence.
+    Claim topics are routing hints only, never ground truth.
+    Factual conclusions must come from MCP evidence.
     """
-    topics = [topic.lower() for topic in _claim_topics(case)]
+    topics = set(_claim_topics(case))
 
     selected = {
         "order-agent",
         "policy-agent",
     }
 
-    payment_match = any(
-        hint in topic
-        for topic in topics
-        for hint in PAYMENT_HINTS
-    )
+    payment_topics = {
+        "canceled_order_paid",
+        "unavailable_order_paid",
+        "valid_split_payment",
+        "payment_mismatch",
+        "duplicate_charge",
+        "refund_pending",
+        "refund_failed",
+        "requested_full_refund",
+    }
 
-    shipment_match = any(
-        hint in topic
-        for topic in topics
-        for hint in SHIPMENT_HINTS
-    )
+    shipment_topics = {
+        "late_delivery_seller",
+        "late_delivery_logistics",
+    }
 
-    if payment_match:
+    if topics & payment_topics:
         selected.add("payment-agent")
 
-    if shipment_match:
+    if topics & shipment_topics:
         selected.add("shipment-agent")
 
-    # If claims give no useful routing signal, investigate broadly rather
-    # than assuming the customer's statement is correct.
-    if not topics or (not payment_match and not shipment_match):
+    # Unknown/unsupported claims should be investigated broadly
+    # rather than trusted at face value.
+    if "unsupported_claim" in topics or not topics:
         selected.add("payment-agent")
         selected.add("shipment-agent")
 
@@ -130,7 +131,6 @@ def _select_specialists(case: dict[str, Any]) -> list[str]:
     )
 
     return [actor for actor in order if actor in selected]
-
 
 def plan_tasks(case: dict[str, Any]) -> list[AgentTask]:
     case_id = case.get("case_id")

@@ -141,34 +141,81 @@ class TestRefundLines:
 
 # ====== ASYNC TESTS ======
 
-import pytest
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, Mock
 
 
-@pytest.mark.asyncio
-async def test_collect_payment_evidence_calls_all_tools():
+def test_collect_payment_evidence_calls_all_tools():
     """collect_payment_evidence phải gọi đủ 3 tools"""
     from student_agent.agents.payment_agent import collect_payment_evidence
 
     mock_gateway = AsyncMock()
     mock_gateway.list_tools.return_value = [
-        "get_order_payments", "get_payment_timeline", "get_refund_timeline"
+        "get_order_payments",
+        "get_payment_timeline",
+        "get_refund_timeline",
     ]
     mock_gateway.call.return_value = {
         "evidence_ref": "ev_" + "x" * 20,
         "data": {},
     }
 
-    mock_trace = AsyncMock()
-    mock_trace.emit = AsyncMock()
+    # TraceWriter.emit() là synchronous
+    mock_trace = Mock()
 
-    result = await collect_payment_evidence(
-        case_id="case_test",
-        order_id="order_123",
-        gateway=mock_gateway,
-        trace=mock_trace,
+    result = asyncio.run(
+        collect_payment_evidence(
+            case_id="case_test",
+            order_id="order_123",
+            gateway=mock_gateway,
+            trace=mock_trace,
+        )
     )
 
     assert result["case_id"] == "case_test"
     assert len(result["evidence_refs"]) >= 1
-    assert mock_gateway.call.call_count == 3  # 3 tools được gọi
+    assert mock_gateway.call.call_count == 3
+    assert mock_trace.emit.call_count == 3
+
+def test_payment_agent_run_matches_common_contract():
+    from student_agent.agents.payment_agent import run
+    from student_agent.models import AgentResult, AgentTask
+
+    gateway = AsyncMock()
+
+    gateway.list_tools.return_value = [
+        "get_order_payments",
+        "get_payment_timeline",
+        "get_refund_timeline",
+    ]
+
+    gateway.call.return_value = {
+        "evidence_ref": "ev_" + "z" * 20,
+        "data": {},
+    }
+
+    trace = Mock()
+
+    task = AgentTask(
+        case_id="CASE_001",
+        task_id="CASE_001:payment-agent",
+        actor="payment-agent",
+        objective="Verify payment.",
+        context={
+            "claimed_order_id": "order-123",
+        },
+    )
+
+    result = asyncio.run(
+        run(
+            task,
+            gateway,
+            trace,
+        )
+    )
+
+    assert isinstance(result, AgentResult)
+    assert result.case_id == task.case_id
+    assert result.task_id == task.task_id
+    assert result.actor == "payment-agent"
+    assert result.evidence_refs
