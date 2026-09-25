@@ -2,98 +2,154 @@
 
 ## 1. System overview
 
+Hệ thống xử lý mỗi case theo luồng:
+
 ```text
-inputs/<case_id>.json
-  -> CLI emits case_received
-  -> Coordinator plans AgentTask envelopes
-  -> Dispatcher invokes shared specialist run(task, gateway, trace)
-  -> Specialists consume case-scoped MCP evidence
-  -> Coordinator hands AgentResult envelopes to Verifier
-  -> Verifier selects relevant evidence and checks consistency
-  -> build_output creates the public L3A V2 object
-  -> public schema validation
-  -> CLI emits case_finalized and writes outputs/<case_id>.json
+Input
+  ↓
+Coordinator
+  ↓
+Specialist Agents
+  ├── Order/Item Agent
+  ├── Payment Agent
+  ├── Shipment Agent
+  └── Policy Agent
+  ↓
+Verifier
+  ↓
+Output JSON
+
+Specialist Agents ── MCP Evidence Gateway
+All stages ────────── Trace
 ```
 
-The coordinator owns orchestration only. Domain interpretation stays in the
-specialists and cross-domain checks stay in the verifier.
+Coordinator chỉ điều phối và handoff. Customer claim chỉ được dùng làm tín hiệu routing, không được coi là ground truth. Mọi kết luận nghiệp vụ phải dựa trên evidence từ MCP.
+
+---
 
 ## 2. Agent ownership
 
-| Actor | Input | Responsibility | Output / handoff |
-| --- | --- | --- | --- |
-| Coordinator | Public case | Route claim hints, enrich later tasks with authoritative earlier findings, and sequence handoffs | `AgentTask` and observable lifecycle events |
-| Order/item | `AgentTask` | `get_order`, `get_order_items`; normalize order status, entities, and item total | Shared `AgentResult` |
-| Payment | `AgentTask` | `get_order_payments`, `get_payment_timeline`, optional `get_refund_timeline`; reconcile events within the case timeline | Shared `AgentResult` |
-| Shipment | `AgentTask` | `get_shipment_summary`; verify confirmed late-delivery attribution | Shared `AgentResult` |
-| Policy | `AgentTask` | `get_policy` for the requested `policy_version`; expose machine-readable business rules | Shared `AgentResult` plus `policy_decided` |
-| Verifier | Case and specialist results | Check scope, ownership, linkage, relevance, money, responsibility/action consistency, duplicates, confidence, conflicts, and schema | `VerificationResult` with a selected evidence subset |
+| Actor            | Input                     | Trách nhiệm                                                                    | MCP tools / Output                                                                  |
+| ---------------- | ------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| Coordinator      | Case input                | Chọn specialist, tạo task, tổng hợp kết quả và handoff                         | Không gọi domain MCP                                                                |
+| Order/Item Agent | `AgentTask`               | Xác minh order, item, seller và tổng giá trị đơn                               | `get_order`, `get_order_items` → `AgentResult`                                      |
+| Payment Agent    | `AgentTask`               | Xác minh payment, payment timeline, refund                                     | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` → `AgentResult` |
+| Shipment Agent   | `AgentTask`               | Xác minh shipment và nguyên nhân giao hàng trễ                                 | `get_shipment_summary` → `AgentResult`                                              |
+| Policy Agent     | `AgentTask`               | Lấy policy áp dụng cho case                                                    | `get_policy` → `AgentResult`                                                        |
+| Verifier         | Case + specialist results | Chọn evidence liên quan, kiểm tra consistency, confidence và tạo kết luận cuối | `VerificationResult`                                                                |
 
-The coordinator never calls domain MCP tools. Every MCP call receives exactly
-the current task's `case_id`.
+Mỗi agent chỉ sử dụng các MCP tools thuộc phạm vi trách nhiệm của mình.
+
+---
 
 ## 3. A2A protocol
 
-`AgentTask` and `AgentResult` in `src/student_agent/models.py` are the only
-specialist envelopes. `task_id` correlates a specialist result to its task and
-`case_id` prevents cross-case reuse. The dispatcher rejects mismatched actor,
-task, case, or result type. Each task executes once, so there is no handoff
-loop. MCP timeouts and domain errors are recorded in `AgentResult.errors`;
-optional refund absence does not abort the case.
+Các agent trao đổi qua hai envelope chung:
 
-Trace contains only observable events and decision codes: `case_received`,
-`task_assigned`, `tool_result_consumed`, `handoff`, `policy_decided`,
-`verification_completed`, and `case_finalized`. It never contains prompts or
-private reasoning.
+* `AgentTask`: task do Coordinator gửi cho specialist.
+* `AgentResult`: kết quả specialist trả về Coordinator.
+
+`case_id` được dùng để đảm bảo mọi task và evidence thuộc đúng case. `task_id` dùng để liên kết task với kết quả tương ứng.
+
+Luồng handoff:
+
+```text
+Coordinator → Specialist → Coordinator → Verifier → Coordinator
+```
+
+Dispatcher kiểm tra `case_id`, `task_id`, actor và kiểu kết quả trước khi chấp nhận.
+
+Mỗi specialist chỉ chạy một lần cho mỗi task nên không tạo vòng lặp A2A.
+
+Trace chỉ lưu các sự kiện quan sát được, không lưu prompt hoặc chain-of-thought.
+
+---
 
 ## 4. Evidence lifecycle
 
-The gateway validates every MCP envelope against the public evidence schema and
-keeps SDK v2 snake-case fields (`is_error`, `structured_content`). A specialist
-copies the returned `evidence_ref` unchanged, emits `tool_result_consumed` only
-when it consumes the response, and returns collected refs in its `AgentResult`.
-
-The verifier chooses only evidence relevant to the final issue. `build_output`
-enforces:
+Mọi evidence được lấy trực tiếp từ MCP Evidence Gateway với đúng `case_id`.
 
 ```text
-final evidence refs ⊆ specialist evidence refs
+MCP call
+  ↓
+MCP response validation
+  ↓
+evidence_ref
+  ↓
+tool_result_consumed
+  ↓
+AgentResult
+  ↓
+Verifier chọn evidence liên quan
+  ↓
+output.evidence_refs
 ```
 
-It also removes duplicates and rejects unknown refs. No customer statement is
-treated as evidence and no evidence ref is generated locally.
+Quy tắc:
+
+* Không tự tạo hoặc sửa `evidence_ref`.
+* Không dùng evidence giữa các case khác nhau.
+* Mỗi evidence được sử dụng phải có event `tool_result_consumed`.
+* Verifier chỉ chọn evidence thực sự hỗ trợ kết luận cuối.
+* Customer message không được coi là evidence.
+
+---
 
 ## 5. Failure policy
 
-| Failure | Retry | Fallback | Observable result |
-| --- | --- | --- | --- |
-| Required order/payment/shipment/policy failure | No implicit retry | Continue with available specialists; prefer `insufficient_evidence` | `AgentResult.errors`, handoff error count |
-| Optional refund timeline unavailable/not found | No | Continue payment analysis without refund facts | `AgentResult.errors` marked optional |
-| Timeout/transient MCP error | No unbounded retry | Same as required/optional classification | Error text without guessed facts |
-| Conflicting totals | No | Keep both sources and request reconciliation | `data_conflicts` with `RECONCILIATION_REQUIRED` |
-| Invalid specialist result | No | Coordinator creates an observable insufficient-evidence result | Handoff with nonzero error count |
+| Failure                              | Retry?             | Fallback                                        | Trace / result                  |
+| ------------------------------------ | ------------------ | ----------------------------------------------- | ------------------------------- |
+| MCP timeout / error                  | Không retry vô hạn | Tiếp tục với evidence còn lại                   | Ghi vào `AgentResult.errors`    |
+| Evidence / record not found          | Không              | Không suy đoán dữ liệu                          | `insufficient_evidence` khi cần |
+| Source conflict                      | Không              | Giữ các nguồn và để Verifier xử lý              | `data_conflicts`                |
+| Invalid specialist result            | Không              | Coordinator chuyển thành kết quả thiếu evidence | Handoff có error                |
+| Optional refund evidence unavailable | Không              | Tiếp tục phân tích payment nếu vẫn đủ evidence  | Ghi lỗi optional                |
+
+Missing evidence không được thay thế bằng dữ liệu tự suy đoán.
+
+---
 
 ## 6. Verification invariants
 
-- Every specialist `case_id` matches the input case.
-- Final evidence belongs to a specialist result for the same case.
-- Claim evidence is a subset of final evidence.
-- Evidence selected for the final issue comes only from routed domain owners.
-- Refund line totals equal `recommended_refund_brl`.
-- Case status, responsible parties, actions, and refund amount come from the
-  applicable MCP business-policy rule.
-- Resolution actions and entity/evidence sets contain no duplicates.
-- Confidence stays in `[0, 1]`.
-- The verifier candidate and final output pass the public L3A V2 schema.
+Trước khi finalize, Verifier kiểm tra:
+
+* `case_id` của mọi specialist phải khớp input.
+* Evidence phải thuộc đúng case hiện tại.
+* Evidence cuối phải xuất phát từ evidence đã được specialist thu thập.
+* Claim assessment phải được evidence phù hợp hỗ trợ.
+* Không có duplicate entity hoặc evidence ref.
+* `recommended_refund_brl >= 0`.
+* Tổng refund lines phải nhất quán với số tiền refund đề xuất.
+* `primary_issue`, responsible party, resolution action và financial resolution phải nhất quán.
+* `confidence` nằm trong `[0, 1]`.
+* Output cuối phải pass `l3a-output-v2.schema.json`.
+
+---
 
 ## 7. Reproducibility
 
-- Python: 3.11 or newer.
-- Dependencies: ranges pinned in `pyproject.toml`, including `mcp>=2,<3`.
-- Specialist execution is sequential and deterministic.
-- No random business decisions; random trace event IDs do not affect output.
-- Commands: `python -m compileall src/student_agent`, `python -m pytest -q`,
-  `day09 validate-inputs`, `day09 run`, `day09 validate`, and
-  `day09 package --output dist/submission.zip`.
-- Secrets remain in ignored environment configuration and are never included
-  in traces or the submission archive.
+* Python: 3.11+
+* Dependencies: quản lý trong `pyproject.toml`.
+* Specialist agents chạy tuần tự để giữ workflow dễ kiểm chứng.
+* Không sử dụng random cho quyết định nghiệp vụ.
+* Không ghi API key vào source, trace hoặc submission.
+
+Các lệnh chính:
+
+```bash
+python -m pip install -e ".[dev]"
+
+day09 validate-inputs
+day09 mcp-tools
+day09 run
+day09 validate
+day09 package --output dist/submission.zip
+```
+
+Submission cuối chỉ gồm:
+
+```text
+manifest.json
+trace.jsonl
+outputs/
+```
