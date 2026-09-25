@@ -165,7 +165,12 @@ async def resolve_policy(
 
 
 class PolicyAgent:
-    async def run(self, task: AgentTask, gateway: EvidenceGateway, trace: TraceWriter) -> AgentResult:
+    async def run(
+        self,
+        task: AgentTask,
+        gateway: EvidenceGateway,
+        trace: TraceWriter,
+    ) -> AgentResult:
         return await run(task, gateway, trace)
 
 

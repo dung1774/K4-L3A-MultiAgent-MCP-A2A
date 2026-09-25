@@ -511,7 +511,11 @@ async def run(
         seller_ids=result["entities"].get("seller_ids", []),
         shipment_ids=result["entities"].get("shipment_ids", []),
         evidence_refs=result["evidence_refs"],
-        confidence=0.85 if result["recommended_primary_issue"] not in {None, "insufficient_evidence"} else 0.4,
+        confidence=(
+            0.85
+            if result["recommended_primary_issue"] not in {None, "insufficient_evidence"}
+            else 0.4
+        ),
         errors=errors,
     )
 

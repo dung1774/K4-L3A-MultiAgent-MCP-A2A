@@ -5,19 +5,20 @@ from typing import Any
 from .models import AgentTask
 from .trace import TraceWriter
 
-
 OBJECTIVES = {
     "order-agent": (
         "Verify order, item, seller and product facts using authoritative MCP evidence."
     ),
     "payment-agent": (
-        "Verify payment, charge, payment timeline and refund facts using authoritative MCP evidence."
+        "Verify payment, charge, payment timeline and refund facts "
+        "using authoritative MCP evidence."
     ),
     "shipment-agent": (
         "Verify shipment and delivery facts and identify logistics-related delays."
     ),
     "policy-agent": (
-        "Retrieve the applicable policy and determine relevant customer rights and resolution rules."
+        "Retrieve the applicable policy and determine relevant customer "
+        "rights and resolution rules."
     ),
 }
 

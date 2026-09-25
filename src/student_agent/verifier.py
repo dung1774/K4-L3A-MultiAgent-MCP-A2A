@@ -142,12 +142,17 @@ def _claim_assessments(
             verdict = "supported"
             claim_confidence = confidence
         elif topic == "requested_full_refund":
-            verdict = "supported" if issue not in {
+            if issue not in {
                 "valid_split_payment",
                 "unsupported_claim",
                 "insufficient_evidence",
                 "refund_pending",
-            } else "unsupported" if issue in {"valid_split_payment", "unsupported_claim"} else "insufficient_evidence"
+            }:
+                verdict = "supported"
+            elif issue in {"valid_split_payment", "unsupported_claim"}:
+                verdict = "unsupported"
+            else:
+                verdict = "insufficient_evidence"
             claim_confidence = confidence
         elif issue == "insufficient_evidence":
             verdict = "insufficient_evidence"
@@ -203,9 +208,12 @@ async def verify_case(
 
     case_status = rule.get("case_status")
     if case_status not in {"action_required", "no_action", "needs_investigation"}:
-        case_status = "needs_investigation" if issue == "insufficient_evidence" else (
-            "no_action" if issue in {"valid_split_payment", "unsupported_claim"} else "action_required"
-        )
+        if issue == "insufficient_evidence":
+            case_status = "needs_investigation"
+        elif issue in {"valid_split_payment", "unsupported_claim"}:
+            case_status = "no_action"
+        else:
+            case_status = "action_required"
     actions = []
     action = rule.get("recommended_action")
     if isinstance(action, str) and action:
@@ -215,7 +223,11 @@ async def verify_case(
 
     parties = rule.get("responsible_parties")
     if not isinstance(parties, list):
-        parties = [{"party_type": "unknown", "party_id": None}] if issue == "insufficient_evidence" else []
+        parties = (
+            [{"party_type": "unknown", "party_id": None}]
+            if issue == "insufficient_evidence"
+            else []
+        )
     parties = [
         {
             "party_type": party.get("party_type", "unknown"),

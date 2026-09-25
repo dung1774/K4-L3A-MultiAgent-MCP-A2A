@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from student_agent import workflow
 from student_agent.contracts import Contracts
 from student_agent.models import AgentResult, VerificationResult
-from student_agent import workflow
 
 
 class FakeTrace:

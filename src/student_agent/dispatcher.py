@@ -6,7 +6,6 @@ from .mcp_gateway import EvidenceGateway
 from .models import AgentResult, AgentTask
 from .trace import TraceWriter
 
-
 AGENT_MODULES = {
     "order-agent": "student_agent.agents.order_agent",
     "payment-agent": "student_agent.agents.payment_agent",

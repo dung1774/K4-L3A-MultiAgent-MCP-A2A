@@ -1,13 +1,14 @@
 """Unit tests cho TV3 — Payment / Refund Agent"""
 
-import pytest
+import asyncio
 from decimal import Decimal
+from unittest.mock import AsyncMock, Mock
 
 from student_agent.agents.payment_agent import (
-    analyze_payment,
     PaymentTransaction,
-    RefundTransaction,
     RefundLine,
+    RefundTransaction,
+    analyze_payment,
 )
 
 # ====== HELPERS ======
@@ -134,16 +135,15 @@ class TestRefundLines:
             refund_lines=lines,
         )
         # sum(lines) == recommended_refund_brl
-        total = sum(l["amount_brl"] for l in result["financial_resolution"]["refund_lines"])
+        total = sum(
+            line["amount_brl"]
+            for line in result["financial_resolution"]["refund_lines"]
+        )
         assert total == result["financial_resolution"]["recommended_refund_brl"]
         assert total == 100.0
 
 
 # ====== ASYNC TESTS ======
-
-import asyncio
-from unittest.mock import AsyncMock, Mock
-
 
 def test_collect_payment_evidence_calls_all_tools():
     """collect_payment_evidence phải gọi đủ 3 tools"""

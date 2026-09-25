@@ -8,15 +8,16 @@ This module never invents evidence references or decides refund eligibility.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from typing import Any, Literal
+
 from ..mcp_gateway import EvidenceGateway
 from ..models import AgentResult, AgentTask
 from ..trace import TraceWriter
-import re
-from typing import Any, Literal
 
 PaymentStatus = Literal["captured", "pending", "failed"]
 RefundStatus = Literal["completed", "pending", "failed"]
@@ -322,9 +323,10 @@ def _within_case_window(
     selected: list[dict[str, Any]] = []
     for event in events:
         occurred = _timestamp(event.get("event_at"))
-        if occurred is None:
-            selected.append(event)
-        elif (start is None or occurred >= start) and (end is None or occurred <= end):
+        in_window = (start is None or occurred is None or occurred >= start) and (
+            end is None or occurred is None or occurred <= end
+        )
+        if in_window:
             selected.append(event)
     return selected
 
@@ -366,7 +368,8 @@ def normalize_payment_evidence(
         event
         for event in timeline_events
         if str(event.get("event_type", "")).lower() in {"captured", "charged"}
-        and str(event.get("status", "")).lower() in {"confirmed", "completed", "captured", "success"}
+        and str(event.get("status", "")).lower()
+        in {"confirmed", "completed", "captured", "success"}
     ]
     captured_values = [
         amount
@@ -403,7 +406,9 @@ def normalize_payment_evidence(
     elif duplicate_events or (duplicate_rows and expected is None):
         verdict = "duplicate_charge"
         confidence = 0.90
-    elif has_mismatch_event or (expected is not None and capture_events and captured_total != expected):
+    elif has_mismatch_event or (
+        expected is not None and capture_events and captured_total != expected
+    ):
         verdict = "payment_mismatch"
         confidence = 0.90
     elif expected is not None and capture_count > 1 and captured_total == expected:
