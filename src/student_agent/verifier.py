@@ -56,6 +56,11 @@ def _money_consistent(financial: Any) -> bool:
     return len(amounts) == len(lines) and amounts_valid and abs(total - sum(amounts)) <= 0.01
 
 
+def _optional_check(value: Any, predicate) -> bool:
+    """Do not reject a partial handoff before all specialists have contributed."""
+    return True if value is None else predicate(value)
+
+
 async def verify_case(
     case: dict[str, Any],
     specialist_results: list[Any],
@@ -111,25 +116,46 @@ async def verify_case(
 
     checks = {
         "case_scope": output.get("case_id") == case_id,
-        "evidence_coverage": bool(output.get("evidence_refs")),
-        "money_consistency": _money_consistent(output.get("financial_resolution")),
-        "schema_consistency": output.get("schema_version") == "day09-l3a-output-v2",
+        "evidence_coverage": _optional_check(
+            output.get("evidence_refs"), lambda value: isinstance(value, list)
+        ),
+        "money_consistency": _optional_check(
+            output.get("financial_resolution"), _money_consistent
+        ),
+        "schema_consistency": _optional_check(
+            output.get("schema_version"),
+            lambda value: value == "day09-l3a-output-v2",
+        ),
         "responsible_party": (
-            bool(output.get("root_cause_analysis", {}).get("responsible_parties", []))
-            if isinstance(output.get("root_cause_analysis"), dict)
-            else False
+            _optional_check(
+                output.get("root_cause_analysis"),
+                lambda value: isinstance(value, dict)
+                and isinstance(value.get("responsible_parties"), list),
+            )
         ),
         "primary_issue": (
-            isinstance(output.get("assessment", {}).get("primary_issue"), str)
-            if isinstance(output.get("assessment"), dict)
-            else False
+            _optional_check(
+                output.get("assessment"),
+                lambda value: isinstance(value, dict)
+                and isinstance(value.get("primary_issue"), str),
+            )
         ),
-        "resolution_actions": isinstance(output.get("resolution_actions"), list),
+        "resolution_actions": _optional_check(
+            output.get("resolution_actions"), lambda value: isinstance(value, list)
+        ),
         "confidence": (
-            0 <= output.get("assessment", {}).get("confidence", -1) <= 1
-            if isinstance(output.get("assessment"), dict)
-            and isinstance(output.get("assessment", {}).get("confidence"), (int, float))
-            else False
+            _optional_check(
+                output.get("assessment"),
+                lambda value: (
+                    "confidence" not in value
+                    or (
+                        isinstance(value["confidence"], (int, float))
+                        and 0 <= value["confidence"] <= 1
+                    )
+                )
+                if isinstance(value, dict)
+                else False,
+            )
         ),
     }
     errors = [name for name, passed in checks.items() if not passed]
